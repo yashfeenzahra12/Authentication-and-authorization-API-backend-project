@@ -1,0 +1,540 @@
+require("dotenv").config();
+
+const express = require("express");
+const { Pool } = require("pg");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
+const crypto = require("crypto");
+const helmet = require("helmet");
+const rateLimit = require("express-rate-limit");
+
+const app = express();
+
+app.use(helmet());
+app.use(express.json({ limit: "10kb" }));
+
+const PORT = process.env.PORT || 3000;
+const JWT_SECRET = process.env.JWT_SECRET;
+const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || "1h";
+const BCRYPT_ROUNDS = Number(process.env.BCRYPT_ROUNDS || 12);
+
+if (!process.env.DATABASE_URL) {
+  throw new Error("DATABASE_URL is required in .env");
+}
+
+if (!JWT_SECRET || JWT_SECRET.length < 32) {
+  throw new Error("JWT_SECRET must be at least 32 characters.");
+}
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  max: 10,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 5000
+});
+
+class ApiError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
+
+const asyncHandler = (fn) => (req, res, next) =>
+  Promise.resolve(fn(req, res, next)).catch(next);
+
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 20,
+  standardHeaders: "draft-8",
+  legacyHeaders: false,
+  message: {
+    error: "Too many attempts. Please try again later."
+  }
+});
+
+function validateEmail(email) {
+  return typeof email === "string" &&
+    email.length <= 255 &&
+    /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
+function validateName(name) {
+  if (
+    typeof name !== "string" ||
+    !name.trim() ||
+    name.trim().length > 100
+  ) {
+    throw new ApiError(
+      400,
+      "Name must contain 1 to 100 characters."
+    );
+  }
+
+  return name.trim();
+}
+
+function publicUser(user) {
+  return {
+    id: user.id,
+    name: user.name,
+    email: user.email,
+    role: user.role,
+    createdAt: user.created_at
+  };
+}
+
+function generateToken(user) {
+  return jwt.sign(
+    { role: user.role },
+    JWT_SECRET,
+    {
+      subject: user.id,
+      expiresIn: JWT_EXPIRES_IN,
+      algorithm: "HS256",
+      issuer: "jwt-auth-api",
+      audience: "jwt-auth-client"
+    }
+  );
+}
+
+// Create the users table.
+async function initializeDatabase() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id UUID PRIMARY KEY,
+      name VARCHAR(100) NOT NULL,
+      email VARCHAR(255) UNIQUE NOT NULL,
+      password_hash TEXT NOT NULL,
+      role VARCHAR(20) NOT NULL DEFAULT 'user'
+        CHECK (role IN ('user', 'admin', 'owner')),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  // Optional first administrator, configured through .env.
+  const adminEmail = process.env.ADMIN_EMAIL?.trim().toLowerCase();
+  const adminPassword = process.env.ADMIN_PASSWORD;
+
+  if (adminEmail && adminPassword) {
+    if (!validateEmail(adminEmail)) {
+      throw new Error("ADMIN_EMAIL is invalid.");
+    }
+
+    if (adminPassword.length < 12 || adminPassword.length > 72) {
+      throw new Error(
+        "ADMIN_PASSWORD must contain 12 to 72 characters."
+      );
+    }
+
+    const existing = await pool.query(
+      "SELECT id FROM users WHERE email = $1",
+      [adminEmail]
+    );
+
+    if (existing.rowCount === 0) {
+      const passwordHash = await bcrypt.hash(
+        adminPassword,
+        BCRYPT_ROUNDS
+      );
+
+      await pool.query(
+        `INSERT INTO users
+          (id, name, email, password_hash, role)
+         VALUES ($1, $2, $3, $4, 'admin')`,
+        [
+          crypto.randomUUID(),
+          "Administrator",
+          adminEmail,
+          passwordHash
+        ]
+      );
+    }
+  }
+}
+
+// Verify JWT authentication.
+function authenticate(req, res, next) {
+  const authorization = req.headers.authorization;
+
+  if (!authorization || !authorization.startsWith("Bearer ")) {
+    return next(
+      new ApiError(401, "Authentication token is required.")
+    );
+  }
+
+  const token = authorization.slice(7).trim();
+
+  jwt.verify(
+    token,
+    JWT_SECRET,
+    {
+      algorithms: ["HS256"],
+      issuer: "jwt-auth-api",
+      audience: "jwt-auth-client"
+    },
+    (error, payload) => {
+      if (error) {
+        return next(
+          new ApiError(401, "Invalid or expired token.")
+        );
+      }
+
+      if (!payload.sub) {
+        return next(new ApiError(401, "Invalid token."));
+      }
+
+      req.auth = { userId: payload.sub };
+      next();
+    }
+  );
+}
+
+// Retrieve the current user and role from PostgreSQL.
+const loadUser = asyncHandler(async (req, res, next) => {
+  const result = await pool.query(
+    `SELECT id, name, email, role, created_at
+     FROM users WHERE id = $1`,
+    [req.auth.userId]
+  );
+
+  if (!result.rows[0]) {
+    throw new ApiError(401, "User account not found.");
+  }
+
+  req.user = result.rows[0];
+  next();
+});
+
+// Role-based authorization.
+function authorize(...roles) {
+  return (req, res, next) => {
+    if (!req.user || !roles.includes(req.user.role)) {
+      return next(
+        new ApiError(403, "Access denied: insufficient permissions.")
+      );
+    }
+
+    next();
+  };
+}
+
+// Home route.
+app.get("/", (req, res) => {
+  res.json({
+    message: "JWT Authentication and Authorization API",
+    status: "running"
+  });
+});
+
+// Health check.
+app.get("/api/health", asyncHandler(async (req, res) => {
+  await pool.query("SELECT 1");
+
+  res.json({
+    status: "OK",
+    database: "connected"
+  });
+}));
+
+// USER REGISTRATION.
+app.post(
+  "/api/auth/register",
+  authLimiter,
+  asyncHandler(async (req, res) => {
+    const { name, email, password } = req.body;
+
+    const validName = validateName(name);
+
+    if (!validateEmail(email)) {
+      throw new ApiError(400, "Please enter a valid email address.");
+    }
+
+    if (
+      typeof password !== "string" ||
+      password.length < 8 ||
+      password.length > 72
+    ) {
+      throw new ApiError(
+        400,
+        "Password must contain 8 to 72 characters."
+      );
+    }
+
+    const normalizedEmail = email.trim().toLowerCase();
+
+    // Hash the password before storing it.
+    const passwordHash = await bcrypt.hash(
+      password,
+      BCRYPT_ROUNDS
+    );
+
+    // Public registration cannot assign an administrator role.
+    const result = await pool.query(
+      `INSERT INTO users
+        (id, name, email, password_hash, role)
+       VALUES ($1, $2, $3, $4, 'user')
+       RETURNING id, name, email, role, created_at`,
+      [
+        crypto.randomUUID(),
+        validName,
+        normalizedEmail,
+        passwordHash
+      ]
+    );
+
+    const user = result.rows[0];
+
+    res.status(201).json({
+      message: "User registered successfully.",
+      user: publicUser(user),
+      token: generateToken(user),
+      tokenType: "Bearer",
+      expiresIn: JWT_EXPIRES_IN
+    });
+  })
+);
+
+// USER LOGIN.
+app.post(
+  "/api/auth/login",
+  authLimiter,
+  asyncHandler(async (req, res) => {
+    const { email, password } = req.body;
+
+    if (!validateEmail(email) || typeof password !== "string") {
+      throw new ApiError(400, "Valid email and password are required.");
+    }
+
+    const result = await pool.query(
+      `SELECT id, name, email, password_hash, role, created_at
+       FROM users WHERE email = $1`,
+      [email.trim().toLowerCase()]
+    );
+
+    const user = result.rows[0];
+
+    if (
+      !user ||
+      !(await bcrypt.compare(password, user.password_hash))
+    ) {
+      throw new ApiError(401, "Invalid email or password.");
+    }
+
+    res.json({
+      message: "Login successful.",
+      user: publicUser(user),
+      token: generateToken(user),
+      tokenType: "Bearer",
+      expiresIn: JWT_EXPIRES_IN
+    });
+  })
+);
+
+// VIEW YOUR OWN PROFILE.
+app.get(
+  "/api/auth/me",
+  authenticate,
+  loadUser,
+  (req, res) => {
+    res.json({ user: publicUser(req.user) });
+  }
+);
+
+// UPDATE YOUR OWN PROFILE.
+app.patch(
+  "/api/auth/me",
+  authenticate,
+  loadUser,
+  asyncHandler(async (req, res) => {
+    const name = validateName(req.body.name);
+
+    const result = await pool.query(
+      `UPDATE users
+       SET name = $1, updated_at = NOW()
+       WHERE id = $2
+       RETURNING id, name, email, role, created_at`,
+      [name, req.user.id]
+    );
+
+    res.json({
+      message: "Profile updated successfully.",
+      user: publicUser(result.rows[0])
+    });
+  })
+);
+
+// ADMIN: VIEW ALL USERS.
+app.get(
+  "/api/users",
+  authenticate,
+  loadUser,
+  authorize("admin"),
+  asyncHandler(async (req, res) => {
+    const result = await pool.query(
+      `SELECT id, name, email, role, created_at
+       FROM users
+       ORDER BY created_at DESC
+       LIMIT 200`
+    );
+
+    res.json({
+      count: result.rows.length,
+      users: result.rows.map(publicUser)
+    });
+  })
+);
+
+// ADMIN: CHANGE A USER'S ROLE.
+app.patch(
+  "/api/users/:id/role",
+  authenticate,
+  loadUser,
+  authorize("admin"),
+  asyncHandler(async (req, res) => {
+    const { role } = req.body;
+    const allowedRoles = ["user", "owner", "admin"];
+
+    if (!allowedRoles.includes(role)) {
+      throw new ApiError(
+        400,
+        "Role must be user, owner, or admin."
+      );
+    }
+
+    if (req.params.id === req.user.id && role !== "admin") {
+      throw new ApiError(
+        400,
+        "You cannot remove your own admin role."
+      );
+    }
+
+    const result = await pool.query(
+      `UPDATE users
+       SET role = $1, updated_at = NOW()
+       WHERE id = $2
+       RETURNING id, name, email, role, created_at`,
+      [role, req.params.id]
+    );
+
+    if (!result.rows[0]) {
+      throw new ApiError(404, "User not found.");
+    }
+
+    res.json({
+      message: "User role updated successfully.",
+      user: publicUser(result.rows[0])
+    });
+  })
+);
+
+// ADMIN: DELETE A USER.
+app.delete(
+  "/api/users/:id",
+  authenticate,
+  loadUser,
+  authorize("admin"),
+  asyncHandler(async (req, res) => {
+    if (req.params.id === req.user.id) {
+      throw new ApiError(
+        400,
+        "You cannot delete your own administrator account."
+      );
+    }
+
+    const result = await pool.query(
+      `DELETE FROM users
+       WHERE id = $1
+       RETURNING id, name, email, role`,
+      [req.params.id]
+    );
+
+    if (!result.rows[0]) {
+      throw new ApiError(404, "User not found.");
+    }
+
+    res.json({
+      message: "User deleted successfully.",
+      user: result.rows[0]
+    });
+  })
+);
+
+// HANDLE UNKNOWN ROUTES.
+app.use((req, res, next) => {
+  next(
+    new ApiError(
+      404,
+      `Route not found: ${req.method} ${req.path}`
+    )
+  );
+});
+
+// CENTRAL ERROR HANDLER.
+app.use((err, req, res, next) => {
+  if (res.headersSent) return next(err);
+
+  if (err instanceof ApiError) {
+    return res.status(err.status).json({
+      error: err.message
+    });
+  }
+
+  if (err.code === "23505") {
+    return res.status(409).json({
+      error: "An account with this email already exists."
+    });
+  }
+
+  if (err.code === "22P02") {
+    return res.status(400).json({
+      error: "Invalid ID or input format."
+    });
+  }
+
+  if (err instanceof SyntaxError && err.status === 400) {
+    return res.status(400).json({
+      error: "Invalid JSON request body."
+    });
+  }
+
+  console.error("Server error:", err.message);
+
+  res.status(500).json({
+    error: "Internal server error."
+  });
+});
+
+// START THE SERVER.
+let server;
+
+async function startServer() {
+  await initializeDatabase();
+
+  server = app.listen(PORT, () => {
+    console.log(`Server running at http://localhost:${PORT}`);
+  });
+}
+
+startServer().catch((error) => {
+  console.error("Startup failed:", error.message);
+  process.exitCode = 1;
+});
+
+// GRACEFUL SHUTDOWN.
+async function shutdown() {
+  if (server) {
+    await new Promise((resolve) => server.close(resolve));
+  }
+
+  await pool.end();
+}
+
+process.on("SIGINT", () => {
+  shutdown().finally(() => process.exit(0));
+});
+
+process.on("SIGTERM", () => {
+  shutdown().finally(() => process.exit(0));
+});
